@@ -7,12 +7,14 @@ const config = require('config')
 const errors = require('common-errors')
 const fileTypeFinder = require('file-type')
 const joi = require('joi')
-const path = require('path')
 const _ = require('lodash')
 const s3 = new AWS.S3()
 const logger = require('../common/logger')
 const HelperService = require('./HelperService')
 const tracer = require('../common/tracer')
+const dbhelper = require('../common/dbhelper')
+const model = require('../models/SubmissionArtifactMap')
+const SubmissionService = require('./SubmissionService')
 
 /*
  * Function to upload file to S3
@@ -34,6 +36,103 @@ function * _uploadToS3 (file, name) {
   return s3.upload(params).promise()
 }
 
+/*
+ * Function to create a submission-artifact mapping
+ * @param {Object} mapObject The mapping object to be inserted
+ * @param {Object} parentSpan The parent span object
+ * @return {Promise}
+ */
+function * createSubmissionArtifactMap (mapObject, parentSpan) {
+  const createSubmissionArtifactMapSpan = tracer.startChildSpans('ArtifactService.createSubmissionArtifactMap', parentSpan)
+  createSubmissionArtifactMapSpan.setTag('submissionId', mapObject.submissionId)
+  createSubmissionArtifactMapSpan.setTag('artifactFileName', mapObject.artifactFileName)
+  createSubmissionArtifactMapSpan.setTag('s3Key', mapObject.s3Key)
+
+  try {
+    const record = {
+      TableName: model.SubmissionArtifactMap.TableName,
+      Item: mapObject
+    }
+    yield dbhelper.insertRecord(record, createSubmissionArtifactMapSpan)
+  } finally {
+    createSubmissionArtifactMapSpan.finish()
+  }
+}
+
+/*
+ * Function to get submission-artifact mapping from DynamoDB
+ * @param {Object} submissionId The ID of the submission
+ * @param {Object} artifactFileName The name of the artifact
+ * @param {Object} parentSpan The parent span
+ * @return {Object} Data from DynamoDB
+ */
+function * getSubmissionArtifactMap (submissionId, artifactFileName, parentSpan) {
+  const getSubmissionArtifactMapSpan = tracer.startChildSpans('ArtifactService.getSubmissionArtifactMap', parentSpan)
+  getSubmissionArtifactMapSpan.setTag('submissionId', submissionId)
+  getSubmissionArtifactMapSpan.setTag('artifactFileName', artifactFileName)
+
+  try {
+    const filter = {
+      TableName: model.SubmissionArtifactMap.TableName,
+      Key: {
+        submissionId,
+        artifactFileName
+      }
+    }
+
+    const result = yield dbhelper.getRecord(filter, getSubmissionArtifactMapSpan)
+    return result.Item
+  } finally {
+    getSubmissionArtifactMapSpan.finish()
+  }
+}
+
+/*
+ * Function to get all submission-artifact mappings from DynamoDB for
+ * submissionId
+ * @param {Object} submissionId The ID of the submission
+ * @param {Object} parentSpan The parent span
+ * @return {Object} Data from DynamoDB
+ */
+function * getArtifactsForSubmissionFromMap (submissionId, parentSpan) {
+  const getArtifactsForSubmissionFromMapSpan = tracer.startChildSpans('ArtifactService.getArtifactsForSubmissionFromMap', parentSpan)
+  getArtifactsForSubmissionFromMapSpan.setTag('submissionId', submissionId)
+
+  try {
+    const filter = {
+      TableName: model.SubmissionArtifactMap.TableName,
+      KeyConditionExpression: 'submissionId = :p_submissionId',
+      ExpressionAttributeValues: {
+        ':p_submissionId': submissionId
+      }
+    }
+
+    const result = yield dbhelper.queryRecords(filter, getArtifactsForSubmissionFromMapSpan)
+    return result.Items
+  } finally {
+    getArtifactsForSubmissionFromMapSpan.finish()
+  }
+}
+
+function * deleteSubmissionArtifactMap (submissionId, artifactFileName, parentSpan) {
+  const deleteSubmissionArtifactMapSpan = tracer.startChildSpans('ArtifactService.deleteSubmissionArtifactMap', parentSpan)
+  deleteSubmissionArtifactMapSpan.setTag('submissionId', submissionId)
+  deleteSubmissionArtifactMapSpan.setTag('artifactFileName', artifactFileName)
+  try {
+    const filter = {
+      TableName: model.SubmissionArtifactMap.TableName,
+      Key: {
+        submissionId,
+        artifactFileName
+      }
+    }
+
+    yield dbhelper.deleteRecord(filter, deleteSubmissionArtifactMapSpan)
+  } finally {
+    deleteSubmissionArtifactMapSpan.finish()
+  }
+}
+
 /**
  * Function to download Artifact from S3
  * @param {String} submissionId Submission ID
@@ -50,25 +149,12 @@ function * downloadArtifact (submissionId, fileName, span) {
     // Check the validness of Submission ID
     yield HelperService._checkRef({submissionId}, downloadArtifactSpan)
 
-    const listObjectsSpan = tracer.startChildSpans('S3.listObjects', downloadArtifactSpan)
-    listObjectsSpan.setTag('Bucket', config.aws.ARTIFACT_BUCKET)
-    listObjectsSpan.setTag('Prefix', `${submissionId}/${fileName}`)
-
-    let artifacts
-    try {
-      artifacts = yield s3.listObjects({Bucket: config.aws.ARTIFACT_BUCKET, Prefix: `${submissionId}/${fileName}`}).promise()
-      if (artifacts.Contents.length === 0) {
-        throw new errors.HttpStatusError(400, `Artifact ${fileName} doesn't exist for ${submissionId}`)
-      }
-    } finally {
-      listObjectsSpan.finish()
+    const result = yield getSubmissionArtifactMap(submissionId, fileName, downloadArtifactSpan)
+    if (_.isNil(result)) {
+      throw new errors.HttpStatusError(404, `Artifact ${fileName} doesn't exist for ${submissionId}`)
     }
 
-    const key = submissionId + '/' + fileName + '.zip'
-
-    if (!_.includes(_.map(artifacts.Contents, 'Key'), key)) {
-      throw new errors.HttpStatusError(400, `Artifact ${fileName} doesn't exist for ${submissionId}`)
-    }
+    const key = result.s3Key
 
     const getObjectsSpan = tracer.startChildSpans('S3.getObject', downloadArtifactSpan)
     getObjectsSpan.setTag('Bucket', config.aws.ARTIFACT_BUCKET)
@@ -109,18 +195,9 @@ function * listArtifacts (submissionId, span) {
     // Check the validness of Submission ID
     yield HelperService._checkRef({submissionId}, listArtifactsSpan)
 
-    const listObjectsSpan = tracer.startChildSpans('S3.listObjects', listArtifactsSpan)
-    listObjectsSpan.setTag('Bucket', config.aws.ARTIFACT_BUCKET)
-    listObjectsSpan.setTag('Prefix', submissionId)
+    const artifacts = yield getArtifactsForSubmissionFromMap(submissionId, listArtifactsSpan)
 
-    let artifacts
-    try {
-      artifacts = yield s3.listObjects({Bucket: config.aws.ARTIFACT_BUCKET, Prefix: submissionId}).promise()
-    } finally {
-      listObjectsSpan.finish()
-    }
-
-    return { artifacts: _.map(artifacts.Contents, (at) => path.parse(at.Key).name) }
+    return { artifacts: _.map(artifacts, (at) => at.artifactFileName) }
   } finally {
     listArtifactsSpan.finish()
   }
@@ -150,7 +227,14 @@ function * createArtifact (files, submissionId, entity, span) {
     logger.info('Creating a new Artifact')
     if (files && files.artifact) {
       const uFileType = fileTypeFinder(files.artifact.data).ext // File type of uploaded file
-      fileName = `${submissionId}/${files.artifact.name}.${uFileType}`
+      const { challengeId, memberId } = yield SubmissionService._getSubmission(submissionId, createArtifactSpan, false)
+      fileName = `${challengeId}/${memberId}/${submissionId}/artifacts/${files.artifact.name}.${uFileType}`
+
+      yield createSubmissionArtifactMap({
+        submissionId,
+        artifactFileName: files.artifact.name,
+        s3Key: fileName
+      }, createArtifactSpan)
 
       const headObjectSpan = tracer.startChildSpans('S3.headObject', createArtifactSpan)
       headObjectSpan.setTag('Bucket', config.aws.ARTIFACT_BUCKET)
@@ -194,12 +278,13 @@ function * deleteArtifact (submissionId, fileName, span) {
   try {
     // Check the validness of Submission ID
     yield HelperService._checkRef({ submissionId }, deleteArtifactSpan)
-    const artifacts = yield s3.listObjects({ Bucket: config.aws.ARTIFACT_BUCKET, Prefix: `${submissionId}/${fileName}` }).promise()
-    if (artifacts.Contents.length === 0) {
-      throw new errors.HttpStatusError(404, `Artifact ${fileName} doesn't exist for submission ID: ${submissionId}`)
+    const result = yield getSubmissionArtifactMap(submissionId, fileName, deleteArtifactSpan)
+    if (_.isNil(result)) {
+      throw new errors.HttpStatusError(404, `Artifact ${fileName} doesn't exist for ${submissionId}`)
     }
+    yield deleteSubmissionArtifactMap(submissionId, fileName, span)
     // Delete the object from S3
-    yield s3.deleteObject({ Bucket: config.aws.ARTIFACT_BUCKET, Key: artifacts.Contents[0].Key }).promise()
+    yield s3.deleteObject({ Bucket: config.aws.ARTIFACT_BUCKET, Key: result.s3Key }).promise()
     logger.info(`deleteArtifact: deleted artifact ${fileName} of Submission ID: ${submissionId}`)
   } finally {
     deleteArtifactSpan.finish()
